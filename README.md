@@ -5,12 +5,15 @@
 
 - 生产源库可写样品库（样品号 / 站号 / pH），开启 **WAL 持续归档**；
 - API 自动制作一份 **物理基准备份**（`pg_basebackup`，源库不停写）；
+- 备份先写入私有 staging，原子发布到唯一目录，**最后一步登记 SQLite 才算成功**；
+  旧备份目录保留不删，失败/重启后旧核对点仍可用原备份恢复；
 - 可随时登记 **命名核对点**（`pg_create_restore_point`）；
 - 按核对点 **PITR 恢复到独立只读实例** 并查询样品；
 - 恢复结果只含核对点前已提交的数据，**跨点后才提交的事务不会出现**；
 - 查询只打恢复实例，**绝不用当前源库冒充恢复结果**；
 - WAL 未归档齐备时任务显示等待、不开放目标查询；
-- 失败或 API 重启后可按原核对点重试；一次只恢复一项；全程不改写生产库。
+- 失败或 API 重启后可按原核对点重试；中断后可再次发起备份；一次只恢复一项；
+  全程不改写生产库。
 
 ## 快速开始
 
@@ -20,7 +23,6 @@ python3 scripts/demo.py             # 端到端演示：更正 / 误删 / 跨点
 ```
 
 Swagger 文档：<http://localhost:8000/docs>
-
 演示脚本依次验证：
 
 | 场景 | 操作 | 恢复校验 |
@@ -58,7 +60,12 @@ Swagger 文档：<http://localhost:8000/docs>
 | 不用源库冒充恢复 | 查询连接的是 `/recoveries/job-N` 下独立实例（端口 55433），响应中标注实例与 as-of LSN |
 | WAL 未齐备显示等待 | 核对点 `waiting_wal` 状态；任务逐段核对"备份起点→核对点"全部 WAL 段，缺段时停留 `waiting_wal` 并列出缺失段 |
 | 不把半库报成功 | pause 后校验 `pg_last_wal_replay_lsn() >= 核对点 LSN` 才 promote；再查 `samples`  sanity + `default_transaction_read_only=on` 才置 `ready`；任何异常 → `failed` + 日志 |
-| 失败/重启可重试 | 任务状态落 SQLite；`POST /api/recoveries/{id}/retry` 按原点重试；API 重启时进行中任务自动重新排队、ready 实例自动拉起 |
+| 失败/重启可重试 | 任务状态落 SQLite；`POST /api/recoveries/{id}/retry` 按原点重试；API 重启时进行中任务自动重新排队并清理残留目录、ready 实例自动拉起 |
+| 备份发布原子化 | staging 下载 → 校验起始 LSN → 写发布标记 → 原子 rename 为 `base-<时间>-<随机>` 唯一目录 → **最后**登记 `done`；旧目录不移动不覆盖，恢复可并发拷贝旧备份 |
+| 失败/重启后旧核对点可用 | 恢复只选 `latest_usable`（`done` 且目录/发布标记/登记 LSN 一致）；`running` 行启动时收敛为 `failed` 并清理其未登记目录；最新备份不可用时自动回退到更早的 `done` 备份 |
+| 未完整登记的新备份不可选 | 仅 `running`/`failed` 行不参与选择；`--force` 重做失败时旧备份仍为 `done` 且原核对点不被标记过期 |
+| 成功发布后按新起点判过期 | 发布提交点写入 `done/published_at` 后，才把恢复点早于新备份起点的核对点置 `expired`；后台刷新线程按同一规则兜底 |
+| 中断后可再次备份 | 最新一次为 `failed` 时 `POST /api/basebackup` 无需 `force` 即视为重试；同一时间仍只允许一个 `running` 备份 |
 | 一次只恢复一项 | 有进行中任务时 `POST /api/recoveries` 返回 409；新任务就绪前会把旧 ready 实例停掉并标记 `superseded` |
 | 源库可写、不被改写 | 基准备份/恢复点均为在线只读操作；API 对源库不执行任何 DML；归档卷对 API 只读挂载 |
 
@@ -67,8 +74,8 @@ Swagger 文档：<http://localhost:8000/docs>
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/health` | 健康检查（源库连通性、已归档 WAL 数） |
-| POST | `/api/basebackup?force=` | 制作物理基准备份（默认启动时自动做一次） |
-| GET | `/api/basebackup` | 备份状态（起始 LSN、大小、历史） |
+| POST | `/api/basebackup?force=` | 制作物理基准备份（默认启动时自动做一次；上次失败时无需 `force` 直接重试） |
+| GET | `/api/basebackup` | 备份状态（`latest_done` 最近登记、`latest_usable` 恢复实际会选用的备份、历史） |
 | POST | `/api/checkpoints` | 登记命名核对点 `{"name": "cp1"}` |
 | GET | `/api/checkpoints` `/api/checkpoints/{name}` | 核对点状态（`waiting_wal`/`ready`/`expired`） |
 | POST | `/api/recoveries` | 按核对点发起恢复 `{"checkpoint": "cp1"}`（一次一项） |
@@ -90,8 +97,8 @@ ready --(新任务就绪前)--> superseded        ready --(DELETE)--> stopped
 ## 手动操作示例（curl）
 
 ```bash
-# 1. 等基准备份完成
-curl -s localhost:8000/api/basebackup | jq .latest_done
+# 1. 等基准备份完成（latest_usable 才是恢复会选用的那份）
+curl -s localhost:8000/api/basebackup | jq .latest_usable
 
 # 2. 登记核对点（等 status 变 ready，通常几秒）
 curl -s -X POST localhost:8000/api/checkpoints -H 'content-type: application/json' -d '{"name":"cp1"}'
@@ -112,9 +119,24 @@ curl -s 'localhost:8000/api/recoveries/1/samples?station_no=ST-02'
 
 - 演示环境口令为 `postgres/postgres`（scram-sha-256，复制连接已在 `db/init/02_hba.sh` 放行），生产使用请更换口令并收敛 pg_hba；
 - 归档卷只增不减，生产需自行配置 WAL 保留/清理策略（如 `pg_archivecleanup` + 备份周期）；
-- 重做基准备份（`force=true`）会使早于新备份起点的核对点过期（`expired`）；
+- 备份目录同样只增不减：重做备份不会删除旧目录（旧核对点恢复仍需要它）；磁盘不足时
+  需确认旧核对点不再需要后，按 `GET /api/basebackup` 历史人工清理 `base-*` 目录；
+- 重做基准备份（`force=true`）成功后，恢复点早于新备份起点的核对点才会标记 `expired`；
+  发布失败或中途退出不会让旧核对点过期；
 - 恢复实例监听容器内 55433，仅 API 经本机 socket 访问，不对外暴露；
 - `/query` 为演示便利，真正兜底是连接级 `default_transaction_read_only=on`，任何写操作都会被数据库拒绝。
+
+## 测试
+
+```bash
+cd api && pip install -r requirements-dev.txt
+python3 -m pytest tests -q                # 备份发布失败 / 重启 / 选择逻辑回归（不需要数据库）
+python3 scripts/e2e_local.py             # 需本机 PostgreSQL 工具：真实 PITR + 发布失败演练
+```
+
+`scripts/e2e_local.py` 用 `PGBIN` 指定 PostgreSQL bin 目录，在临时目录里启动 scratch
+实例，覆盖：真实基准备份 → cp1 误删前恢复 → 重做失败仍用旧备份 → 重启收敛 →
+成功重做后按新起点过期。
 
 ## 已验证项（PostgreSQL 16.10 实测）
 
@@ -126,4 +148,10 @@ curl -s 'localhost:8000/api/recoveries/1/samples?station_no=ST-02'
 - API 优雅重启后 `ready` 实例自动拉起可查；API 被 SIGKILL 于恢复中途（遗留孤儿恢复进程）→ 重启后自动清理并按原点重试至 `ready`；
 - 并发第二个恢复请求返回 409；新任务就绪时旧实例被 `superseded`；
 - 恢复实例直连写入被数据库拒绝（read-only transaction），`/query` 非 SELECT 与多语句被 400 拦截；
-- 强制重做基准备份后旧核对点自动 `expired`，恢复过期核对点返回 409。
+- 强制重做基准备份成功后旧核对点自动 `expired`，恢复过期核对点返回 409；
+- 备份重做失败（`pg_basebackup` 报错 / 发布 rename 失败 / 登记 done 前中断）→ 新行 `failed`、
+  未登记目录不残留，`latest_usable` 仍是旧备份，旧核对点仍可按原备份恢复到 `ready`；
+- 备份中途 SIGKILL API → 重启后 `running` 收敛为 `failed`、staging 清理，随后
+  `POST /api/basebackup` 无需 `force` 即重试成功；成功发布后早于新起点的核对点 `expired`；
+- 发布失败/重启场景见 `api/tests/test_backup_publish.py`、`test_recover_selection.py`
+  （24 项用例，`pytest` 实测通过）以及 `scripts/e2e_local.py`（真实 PostgreSQL 15.20 实测）。

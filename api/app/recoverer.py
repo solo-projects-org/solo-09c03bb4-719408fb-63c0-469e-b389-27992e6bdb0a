@@ -16,7 +16,7 @@ import time
 import psycopg
 from psycopg.rows import dict_row
 
-from . import config, state, source
+from . import backuper, checkpoints, config, state, source
 from .walutil import lsn_to_int, wal_file_name
 
 
@@ -50,12 +50,14 @@ def resume_after_restart() -> None:
     """API 重启后的状态修复。
 
     - 进行中的任务：重新排队，按原核对点从头重试（幂等，数据目录会重建）；
+      其残留数据目录先停实例再清理，避免旧进程占用；
     - 已 ready 的任务：数据目录仍在，直接拉起实例继续提供只读查询。
     """
     active = ",".join(f"'{s}'" for s in state.ACTIVE_JOB_STATES)
     for j in state.all_rows(f"SELECT * FROM jobs WHERE status IN ({active})"):
         if j.get("data_dir"):
             stop_instance(j["data_dir"])  # 防御：进程一般已随重启消失
+            shutil.rmtree(j["data_dir"], ignore_errors=True)
         state.update_job(j["id"], status="queued", cancel_requested=0,
                          detail="API 重启，按原核对点自动重试")
     for j in state.all_rows("SELECT * FROM jobs WHERE status='ready'"):
@@ -74,6 +76,36 @@ def resume_after_restart() -> None:
 
 
 # ---------------------------------------------------------------- 任务执行
+
+def _resolve_backup(cp: dict) -> dict:
+    """为核对点选择备份：只用已完整发布的备份，拒绝过期核对点。
+
+    选择与校验分离，便于回归测试覆盖"失败/未登记备份不被选中"。
+    """
+    backup = backuper.latest_usable()
+    if not backup:
+        raise RuntimeError("没有可用的基准备份，请先 POST /api/basebackup")
+    if cp["status"] == "expired":
+        raise RuntimeError("核对点已过期（存在更新的基准备份），无法恢复")
+    if lsn_to_int(cp["restore_lsn"]) < lsn_to_int(backup["start_lsn"]):
+        # 正常情况下核对点已由发布流程标记 expired；这里兜底重判，
+        # 避免把过期核对点错误地套到新备份上。
+        checkpoints.expire_before(backup)
+        raise RuntimeError(
+            f"核对点 LSN {cp['restore_lsn']} 早于基准备份起点 "
+            f"{backup['start_lsn']}，无法恢复"
+        )
+    return backup
+
+
+def _status_for_backup(backup: dict) -> str | None:
+    """备份是否仍可用于即将开始的拷贝；不可用时返回原因。"""
+    if backup.get("status") != "done" or not backup.get("path"):
+        return "所选基准备份未完整发布"
+    if not os.path.isdir(backup["path"]):
+        return f"基准备份目录失联：{backup['path']}"
+    return None
+
 
 def run_job(job_id: int) -> None:
     job = state.one_row("SELECT * FROM jobs WHERE id=?", (job_id,))
@@ -96,18 +128,7 @@ def run_job(job_id: int) -> None:
         while True:
             _check_cancel(job_id)
             cp = state.one_row("SELECT * FROM checkpoints WHERE id=?", (cp["id"],))
-            if cp["status"] == "expired":
-                raise RuntimeError("核对点已过期（存在更新的基准备份），无法恢复")
-            backup = state.one_row(
-                "SELECT * FROM backups WHERE status='done' ORDER BY id DESC LIMIT 1"
-            )
-            if not backup:
-                raise RuntimeError("没有可用的基准备份，请先 POST /api/basebackup")
-            if lsn_to_int(cp["restore_lsn"]) < lsn_to_int(backup["start_lsn"]):
-                raise RuntimeError(
-                    f"核对点 LSN {cp['restore_lsn']} 早于基准备份起点 "
-                    f"{backup['start_lsn']}，无法恢复"
-                )
+            backup = _resolve_backup(cp)
             if cp["status"] == "ready":
                 missing = _missing_segments(backup, cp, seg_size)
                 if not missing:
@@ -122,13 +143,20 @@ def run_job(job_id: int) -> None:
         _supersede_ready(job_id)
 
         # 3) 拷贝基准备份为独立数据目录
+        problem = _status_for_backup(backup)
+        if problem:
+            raise RuntimeError(problem)
         state.update_job(job_id, status="preparing", detail="拷贝基准备份",
                          data_dir=ddir, port=config.RECOVERY_PORT)
         if _postgres_alive(ddir):
             stop_instance(ddir)
         shutil.rmtree(ddir, ignore_errors=True)
         os.makedirs(config.RECOVERY_DIR, exist_ok=True)
-        shutil.copytree(backup["path"], ddir, symlinks=True)
+        try:
+            shutil.copytree(backup["path"], ddir, symlinks=True)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"拷贝基准备份失败（目录可能已被并发备份替换）：{e}") from e
         os.chmod(ddir, 0o700)
         _write_recovery_conf(ddir, cp["name"])
         _check_cancel(job_id)

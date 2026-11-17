@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS backups (
     size_bytes  INTEGER,
     error       TEXT,
     created_at  TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    published_at TEXT                   -- 唯一发布提交点：成功登记 done 的时刻
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,9 +73,17 @@ def init_db() -> None:
         con = _connect()
         try:
             con.executescript(SCHEMA)
+            _migrate(con)
             con.commit()
         finally:
             con.close()
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """为旧版本状态库补齐新增列（幂等）。"""
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(backups)")}
+    if "published_at" not in existing:
+        con.execute("ALTER TABLE backups ADD COLUMN published_at TEXT")
 
 
 def execute(sql: str, params: tuple = ()) -> int:

@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import backuper, config, recoverer, source, state
+from . import backuper, checkpoints, config, recoverer, source, state
 from .walutil import lsn_to_int
 
 _stop = threading.Event()
@@ -18,12 +18,13 @@ _stop = threading.Event()
 DESCRIPTION = """
 面向水质数仓值班场景的单实例时间点恢复（PITR）服务。
 
-* 基准备份：`pg_basebackup` 在线物理拷贝，源库全程可写；
+* 基准备份：`pg_basebackup` 在线物理拷贝，源库全程可写；staging 校验后原子发布、
+  最后登记 SQLite 才算成功，旧备份保留，失败/重启后旧核对点仍可用原备份恢复；
 * 核对点：`pg_create_restore_point` 命名恢复点 + WAL 归档齐备检查；
 * 恢复：基准备份 + 归档 WAL 重放到核对点（pause → 校验位点 → promote），
-  产出**独立只读**实例；跨点后才提交的事务不会出现；
+  产出**独立只读**实例；跨点后才提交的事务不会出现；只选已完整发布的备份；
 * 查询：只打恢复实例，绝不用当前源库冒充恢复结果；
-* 一次只恢复一项；失败或重启后可按原核对点重试。
+* 一次只恢复一项；失败或重启后可按原核对点重试；中断后可再次发起备份。
 """
 
 
@@ -55,22 +56,8 @@ def _refresher_loop() -> None:
 
 
 def refresh_checkpoints() -> None:
-    """waiting_wal → ready（WAL 已归档）；新基准备份使更早核对点 expired。"""
-    for cp in state.all_rows("SELECT * FROM checkpoints WHERE status='waiting_wal'"):
-        if os.path.exists(os.path.join(config.ARCHIVE_DIR, cp["wal_file"])):
-            state.execute(
-                "UPDATE checkpoints SET status='ready', ready_at=? WHERE id=?",
-                (state.now(), cp["id"]),
-            )
-    backup = backuper.latest_done()
-    if backup:
-        for cp in state.all_rows(
-            "SELECT * FROM checkpoints WHERE status IN ('waiting_wal','ready')"
-        ):
-            if lsn_to_int(cp["restore_lsn"]) < lsn_to_int(backup["start_lsn"]):
-                state.execute(
-                    "UPDATE checkpoints SET status='expired' WHERE id=?", (cp["id"],)
-                )
+    """waiting_wal → ready（WAL 已归档）；仅按已发布基准备份判定 expired。"""
+    checkpoints.refresh(backuper.latest_usable())
 
 
 @asynccontextmanager
@@ -79,14 +66,15 @@ async def lifespan(_app: FastAPI):
               os.path.dirname(config.STATE_DB) or "."):
         os.makedirs(d, exist_ok=True)
     state.init_db()
+    # 先收敛上次中断的备份发布（running→failed、清理未登记目录），
+    # 再让按原核对点重试的任务去选择"最后一个已完整发布"的备份。
+    backuper.reconcile()
     recoverer.resume_after_restart()
     threading.Thread(target=_refresher_loop, name="refresher", daemon=True).start()
     threading.Thread(target=recoverer.dispatch_loop, args=(_stop,),
                      name="dispatcher", daemon=True).start()
-    # 首次启动自动制作一份基准备份
-    if not state.one_row(
-        "SELECT id FROM backups WHERE status IN ('running','done') LIMIT 1"
-    ):
+    # 仅在没有任何可用备份时才自动补做；中断过的 failed 行不会阻止补做。
+    if not backuper.latest_usable():
         try:
             backuper.start_backup()
         except Exception:
@@ -158,7 +146,10 @@ def health():
 @app.get("/api/basebackup", tags=["backup"], summary="基准备份状态")
 def backup_status():
     return {
+        # latest_done 仅表示最近一次登记成功的备份；latest_usable 才是
+        # 恢复任务真正会选用的备份（目录完整且与登记 LSN 一致）。
         "latest_done": backuper.latest_done(),
+        "latest_usable": backuper.latest_usable(),
         "running": state.one_row(
             "SELECT * FROM backups WHERE status='running'"
             " ORDER BY id DESC LIMIT 1"),
@@ -210,12 +201,22 @@ def get_checkpoint(name: str):
 
 # ------------------------------------------------------------------ 恢复任务
 
+def _validate_restorable(cp: dict) -> None:
+    """发起恢复前尽早给出明确 409（真正的选择/校验仍在任务内幂等执行）。"""
+    if cp["status"] == "expired":
+        raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
+    backup = backuper.latest_usable()
+    if not backup:
+        raise HTTPException(409, "没有可用的基准备份，请先 POST /api/basebackup")
+    if lsn_to_int(cp["restore_lsn"]) < lsn_to_int(backup["start_lsn"]):
+        raise HTTPException(409, "核对点早于当前可用基准备份起点，无法恢复")
+
+
 @app.post("/api/recoveries", tags=["recovery"], status_code=202,
           summary="按核对点发起恢复（一次只恢复一项）")
 def start_recovery(body: RecoveryIn):
     cp = _cp_or_404(body.checkpoint)
-    if cp["status"] == "expired":
-        raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
+    _validate_restorable(cp)
     _ensure_no_active_job()
     jid = state.execute(
         "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
@@ -242,8 +243,7 @@ def retry_recovery(job_id: int):
     if job["status"] not in state.RETRYABLE_JOB_STATES:
         raise HTTPException(409, f"任务状态 {job['status']} 不可重试")
     cp = _cp_or_404(job["checkpoint_name"])
-    if cp["status"] == "expired":
-        raise HTTPException(409, "核对点已过期（存在更新的基准备份），无法恢复")
+    _validate_restorable(cp)
     _ensure_no_active_job()
     jid = state.execute(
         "INSERT INTO jobs (checkpoint_name, status, created_at, updated_at)"
